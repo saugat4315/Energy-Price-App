@@ -51,7 +51,7 @@ def strength(r):
 
 def scatter_trend(x, y, labels, xt, yt, color=BLUE):
     fig = go.Figure(go.Scatter(x=x, y=y, mode="markers", text=labels, marker=dict(size=8, color=color, opacity=.7),
-                               hovertemplate="%{text}<br>%{x:.1f}<br>%{y:.1f} EUR/MWh<extra></extra>"))
+                               hovertemplate="%{text}<br>%{x:.1f}<br>%{y:" + DP + "} " + U + "<extra></extra>"))
     r, slope, n = corr_slope(x, y)
     if not np.isnan(r):
         xs = np.array([np.nanmin(x), np.nanmax(x)])
@@ -144,7 +144,17 @@ with tab_in:
         horizon = st.slider("Forecast horizon (days)", 3, 9, 7, help="MET's weather forecast covers about 9 days")
 
     st.divider()
-    st.header("5 · Data sources")
+    st.header("5 · Price unit")
+    u1, u2 = st.columns([1, 2])
+    with u1:
+        unit_choice = st.radio("Show prices in", ["EUR/MWh (market unit)", "NOK/kWh (like your power bill)"], key="unit")
+    with u2:
+        vat = st.checkbox("Include 25 % VAT", False, help="VAT is not charged in Northern Norway (NO4). Grid tariffs and supplier markups are never included.")
+        st.caption("NOK/kWh uses Norges Bank's official EUR→NOK rate for each day (weekends use the last business day). "
+                   "1 EUR/MWh = rate ÷ 1000 NOK/kWh.")
+
+    st.divider()
+    st.header("6 · Data sources")
     status = pd.DataFrame([
         ["Day-ahead prices", "ENTSO-E (key) → falls back to hvakosterstrommen.no (free)", "✅" if has_entsoe else "⚠️ free source only"],
         ["Reservoirs", "NVE magasinstatistikk (free)", "✅"],
@@ -152,8 +162,35 @@ with tab_in:
         ["Weather forecast & nowcast", "MET Locationforecast (free)", "✅"],
         ["Demand, supply, flows", "ENTSO-E (key)", "✅" if has_entsoe else "❌ add ENTSOE_TOKEN"],
         ["River discharge", "NVE HydAPI (key)", "✅" if has_hyd else "❌ add HYDAPI_KEY"],
+        ["EUR→NOK exchange rate", "Norges Bank (free)", "✅"],
     ], columns=["Data", "Source", "Status"])
     st.dataframe(status, hide_index=True, width="stretch")
+
+
+# ======================================================================= units
+NOK = unit_choice.startswith("NOK")
+VAT = 1.25 if (vat and area != "NO4") else 1.0
+U = ("NOK/kWh" if NOK else "€/MWh") + (" incl. VAT" if VAT > 1 else "")
+DP = ".3f" if NOK else ".1f"      # decimals for prices
+DS = "+.3f" if NOK else "+.1f"   # signed
+DSL = "+.4f" if NOK else "+.2f"  # slopes
+
+
+def conv(s):
+    """Convert an EUR/MWh price series (hourly or daily index) to the chosen unit."""
+    if s is None or len(s) == 0:
+        return s
+    if not NOK:
+        return s * VAT
+    idx = s.index.tz_localize(None) if getattr(s.index, "tz", None) is not None else s.index
+    days = idx.normalize()
+    try:
+        rate = ds.eur_nok(days.min().date(), days.max().date())
+        r = rate.reindex(days).ffill().bfill().values
+    except Exception as e:
+        st.toast(f"Norges Bank rate unavailable ({e}); using 11.7 NOK/EUR")
+        r = 11.7
+    return s * r / 1000 * VAT
 
 
 # ======================================================================= load data
@@ -201,8 +238,8 @@ with tab_res:
     elif D["area"] != area or D["start"] != start or D["end"] != end:
         st.warning("Inputs changed. Click **Run analysis** to update.")
     if D:
-        P = D["price"]
-        if P.empty:
+        P = conv(D["price"])
+        if P is None or P.empty:
             st.error("No price data returned for this period.")
             st.stop()
         Pd = ds.daily(P)
@@ -213,15 +250,15 @@ with tab_res:
             last7 = P[P.index >= P.index.max() - pd.Timedelta(days=7)]
             has_tm = (P.index.date == TOMORROW).any()
             m = st.columns(4)
-            m[0].metric("Average price", f"{P.mean():.1f} €/MWh", help="Mean of hourly day-ahead prices, excl. VAT")
-            m[1].metric("Last 7 days", f"{last7.mean():.1f} €/MWh", f"{last7.mean() - P.mean():+.1f} vs period", delta_color="inverse")
-            m[2].metric("Lowest hour", f"{P.min():.1f} €/MWh", P.idxmin().strftime("%d.%m %H:00"), delta_color="off")
-            m[3].metric("Highest hour", f"{P.max():.1f} €/MWh", P.idxmax().strftime("%d.%m %H:00"), delta_color="off")
+            m[0].metric("Average price", f"{P.mean():{DP}} {U}", help="Mean of hourly day-ahead prices, excl. VAT")
+            m[1].metric("Last 7 days", f"{last7.mean():{DP}} {U}", f"{last7.mean() - P.mean():{DS}} vs period", delta_color="inverse")
+            m[2].metric("Lowest hour", f"{P.min():{DP}} {U}", P.idxmin().strftime("%d.%m %H:00"), delta_color="off")
+            m[3].metric("Highest hour", f"{P.max():{DP}} {U}", P.idxmax().strftime("%d.%m %H:00"), delta_color="off")
             m = st.columns(4)
-            m[0].metric("Volatility (std)", f"{P.std():.1f} €/MWh")
+            m[0].metric("Volatility (std)", f"{P.std():{DP}} {U}")
             m[1].metric("Negative-price hours", int((P < 0).sum()))
-            m[2].metric("Daily spread (avg max−min)", f"{(P.resample('D').max() - P.resample('D').min()).mean():.1f} €/MWh")
-            m[3].metric("Tomorrow average", f"{P[P.index.date == TOMORROW].mean():.1f} €/MWh" if has_tm else "after ~13:00")
+            m[2].metric("Daily spread (avg max−min)", f"{(P.resample('D').max() - P.resample('D').min()).mean():{DP}} {U}")
+            m[3].metric("Tomorrow average", f"{P[P.index.date == TOMORROW].mean():{DP}} {U}" if has_tm else "after ~13:00")
             st.caption(f"Source: {D['price_src']}. 15-minute prices (since Oct 2025) are averaged to hourly.")
 
             c1, c2 = st.columns(2)
@@ -237,20 +274,20 @@ with tab_res:
                                      marker_color=[RED if v > 0 else GREEN for v in dev], opacity=.55))
                 fig.add_trace(go.Scatter(x=list(range(24)), y=h.mean(), name="Average price", line=dict(color="#2d3748", width=2.5), mode="lines+markers"))
                 fig_layout(fig, 420, xaxis=dict(title="Hour", tickmode="array", tickvals=list(range(0, 24, 2)), ticktext=[f"{i:02d}:00" for i in range(0, 24, 2)]),
-                           yaxis_title="€/MWh", yaxis2=dict(overlaying="y", side="right", title="€/MWh vs average", showgrid=False))
+                           yaxis_title=f"{U}", yaxis2=dict(overlaying="y", side="right", title=f"{U} vs average", showgrid=False))
                 st.plotly_chart(fig, width="stretch")
             with c2:
                 st.subheader("Hourly price (red = expensive, green = cheap)")
                 hm = pd.DataFrame({"p": P.values}, index=P.index.tz_localize(None))
                 hm = hm.pivot_table(index=hm.index.normalize(), columns=hm.index.hour, values="p")
                 fig = go.Figure(go.Heatmap(z=hm.values, x=[f"{h:02d}:00" for h in hm.columns], y=[d.strftime("%d.%m.%Y") for d in hm.index],
-                                           colorscale="RdYlGn_r", colorbar=dict(title="€/MWh")))
+                                           colorscale="RdYlGn_r", colorbar=dict(title=f"{U}")))
                 fig_layout(fig, max(420, 14 * len(hm)), yaxis=dict(autorange="reversed"), hovermode="closest")
                 st.plotly_chart(fig, width="stretch")
             st.subheader("Daily average and 7-day trend")
             fig = go.Figure([go.Bar(x=Pd.index, y=Pd.values, name="Daily average", marker_color="#90cdf4"),
                              go.Scatter(x=Pd.index, y=Pd.rolling(7, min_periods=3).mean(), name="7-day average", line=dict(color=BLUE, width=3))])
-            st.plotly_chart(fig_layout(fig, 360, yaxis_title="€/MWh"), width="stretch")
+            st.plotly_chart(fig_layout(fig, 360, yaxis_title=f"{U}"), width="stretch")
 
         # ---------------- reservoirs
         with r_res:
@@ -271,17 +308,17 @@ with tab_res:
                 fig.add_trace(go.Scatter(x=Rp.index, y=Rp["median"], name="Median", line=dict(color=ORANGE, dash="dash")), secondary_y=True)
                 fig.add_trace(go.Scatter(x=Rp.index, y=Rp.fyllingsgrad, name="Filling", line=dict(color=GREEN, width=3)), secondary_y=True)
                 fig.add_trace(go.Scatter(x=Pd.index, y=Pd.values, name="Daily price", line=dict(color=BLUE, width=1.5)), secondary_y=False)
-                fig.update_yaxes(title_text="€/MWh", secondary_y=False)
+                fig.update_yaxes(title_text=f"{U}", secondary_y=False)
                 fig.update_yaxes(title_text="Reservoir filling (%)", range=[0, 100], secondary_y=True, showgrid=False)
                 st.plotly_chart(fig_layout(fig, 460), width="stretch")
                 wk = Pd.resample("W-MON", label="left", closed="left").mean()
                 j = Rp[["deviation"]].join(wk.rename("price"), how="inner").dropna()
                 c1, c2 = st.columns(2)
                 with c1:
-                    fig, r, slope, n = scatter_trend(j.deviation, j.price, j.index.strftime("Week of %d.%m"), "Filling minus median (pp)", "Weekly avg price (€/MWh)", GREEN)
+                    fig, r, slope, n = scatter_trend(j.deviation, j.price, j.index.strftime("Week of %d.%m"), "Filling minus median (pp)", f"Weekly avg price ({U})", GREEN)
                     st.plotly_chart(fig, width="stretch")
                     if not np.isnan(r):
-                        st.caption(f"Correlation **{r:.2f}** ({strength(r)}): {slope:+.2f} €/MWh per percentage point, {n} weeks. Negative = fuller reservoirs, lower prices.")
+                        st.caption(f"Correlation **{r:.2f}** ({strength(r)}): {slope:{DSL}} {U} per percentage point, {n} weeks. Negative = fuller reservoirs, lower prices.")
                 with c2:
                     fig = go.Figure(go.Bar(x=Rp.index, y=Rp.deviation, marker_color=[GREEN if v >= 0 else RED for v in Rp.deviation]))
                     st.plotly_chart(fig_layout(fig, 380, yaxis_title="pp vs median", title="Deviation from the 20-year median"), width="stretch")
@@ -307,7 +344,7 @@ with tab_res:
                 for el in W.columns:
                     r, slope, n = corr_slope(j[el], j.price - j.price.mean())
                     rows.append({"Parameter": ds.WEATHER[el][0], "Correlation": r, "Strength": strength(r) if not np.isnan(r) else "–",
-                                 "Price change per unit": f"{slope:+.2f} €/MWh per {ds.WEATHER[el][1]}" if not np.isnan(slope) else "–", "Days": n})
+                                 "Price change per unit": f"{slope:{DSL}} {U} per {ds.WEATHER[el][1]}" if not np.isnan(slope) else "–", "Days": n})
                 st.subheader("Which weather parameter moves with the price?")
                 st.dataframe(pd.DataFrame(rows).sort_values("Correlation", key=lambda s: -s.abs()), hide_index=True, width="stretch",
                              column_config={"Correlation": st.column_config.ProgressColumn(min_value=-1, max_value=1, format="%.2f")})
@@ -321,11 +358,11 @@ with tab_res:
                     fig.add_trace(tr(x=W.index, y=W[el], name=f"{lab} ({unit})", marker_color="#319795", **({} if tr is go.Bar else {"line": dict(color="#319795")})), secondary_y=False)
                     fig.add_trace(go.Scatter(x=Pd.index, y=Pd.values, name="Price", line=dict(color=BLUE)), secondary_y=True)
                     fig.update_yaxes(title_text=f"{lab} ({unit})", secondary_y=False)
-                    fig.update_yaxes(title_text="€/MWh", secondary_y=True, showgrid=False)
+                    fig.update_yaxes(title_text=f"{U}", secondary_y=True, showgrid=False)
                     st.plotly_chart(fig_layout(fig, 400), width="stretch")
                 with c2:
                     dev = j.price - j.price.mean()
-                    fig, r, slope, n = scatter_trend(j[el], dev, j.index.strftime("%d.%m.%Y"), f"{lab} ({unit})", "Price − period average (€/MWh)", "#805ad5")
+                    fig, r, slope, n = scatter_trend(j[el], dev, j.index.strftime("%d.%m.%Y"), f"{lab} ({unit})", f"Price − period average ({U})", "#805ad5")
                     st.plotly_chart(fig, width="stretch")
 
         # ---------------- demand & supply
@@ -350,16 +387,16 @@ with tab_res:
                 fig.add_trace(go.Scatter(x=Ld.index, y=Ld.values, name="Consumption", line=dict(color="#1a202c", width=2.5)), secondary_y=False)
                 fig.add_trace(go.Scatter(x=Pd.index, y=Pd.values, name="Price", line=dict(color=RED, width=2)), secondary_y=True)
                 fig.update_yaxes(title_text="MW (daily average)", secondary_y=False)
-                fig.update_yaxes(title_text="€/MWh", secondary_y=True, showgrid=False)
+                fig.update_yaxes(title_text=f"{U}", secondary_y=True, showgrid=False)
                 st.plotly_chart(fig_layout(fig, 460, title="Production by type vs consumption"), width="stretch")
                 c1, c2 = st.columns(2)
                 with c1:
                     gap = (Ld - gsum).rename("gap")
                     j = gap.to_frame().join(Pd.rename("price"), how="inner").dropna()
-                    fig, r, slope, n = scatter_trend(j.gap, j.price, j.index.strftime("%d.%m.%Y"), "Consumption − production (MW)", "€/MWh")
+                    fig, r, slope, n = scatter_trend(j.gap, j.price, j.index.strftime("%d.%m.%Y"), "Consumption − production (MW)", f"{U}")
                     st.plotly_chart(fig, width="stretch")
                     if not np.isnan(r):
-                        st.caption(f"Correlation **{r:.2f}** ({strength(r)}): +{slope * 1000:.1f} €/MWh per 1,000 MW more import need.")
+                        st.caption(f"Correlation **{r:.2f}** ({strength(r)}): +{slope * 1000:{DP}} {U} per 1,000 MW more import need.")
                 with c2:
                     tot = G.mean()
                     fig = go.Figure(go.Pie(labels=[ds.PSR.get(c, (c,))[0] for c in tot.index], values=tot.values, hole=.45,
@@ -386,12 +423,12 @@ with tab_res:
                 fig.add_trace(go.Scatter(x=Pd.index, y=Pd.values, name="Price", line=dict(color=RED, width=2)), secondary_y=True)
                 fig.update_layout(barmode="relative")
                 fig.update_yaxes(title_text=f"MW (+ into {area})", secondary_y=False)
-                fig.update_yaxes(title_text="€/MWh", secondary_y=True, showgrid=False)
+                fig.update_yaxes(title_text=f"{U}", secondary_y=True, showgrid=False)
                 st.plotly_chart(fig_layout(fig, 460), width="stretch")
                 c1, c2 = st.columns(2)
                 with c1:
                     j = net.rename("net").to_frame().join(Pd.rename("price"), how="inner").dropna()
-                    fig, r, slope, n = scatter_trend(j.net, j.price, j.index.strftime("%d.%m.%Y"), f"Net import into {area} (MW)", "€/MWh", "#805ad5")
+                    fig, r, slope, n = scatter_trend(j.net, j.price, j.index.strftime("%d.%m.%Y"), f"Net import into {area} (MW)", f"{U}", "#805ad5")
                     st.plotly_chart(fig, width="stretch")
                 with c2:
                     tab = pd.DataFrame({"Avg in (MW)": Fl.clip(lower=0).mean(), "Avg out (MW)": -Fl.clip(upper=0).mean(), "Net (MW)": Fl.mean(),
@@ -411,7 +448,7 @@ with tab_res:
                     fig.add_trace(go.Scatter(x=H.index, y=H[c], name=c), secondary_y=False)
                 fig.add_trace(go.Scatter(x=Pd.index, y=Pd.values, name="Price", line=dict(color=GREY, dash="dot")), secondary_y=True)
                 fig.update_yaxes(title_text="Discharge (m³/s)", secondary_y=False)
-                fig.update_yaxes(title_text="€/MWh", secondary_y=True, showgrid=False)
+                fig.update_yaxes(title_text=f"{U}", secondary_y=True, showgrid=False)
                 st.plotly_chart(fig_layout(fig, 440), width="stretch")
 
 # ======================================================================= FORECAST
@@ -422,6 +459,7 @@ with tab_fc:
             t0 = TODAY - dt.timedelta(days=365 * train_years + 35)
             st.write("Prices…")
             hp, src = ds.prices_any(area, t0, TOMORROW)
+            hp = conv(hp)   # train directly in the chosen unit
             d = ds.daily(hp).rename("price").to_frame()
             if ds.secret("FROST_ID"):
                 st.write("Weather history (Frost) and forecast (MET)…")
@@ -458,7 +496,7 @@ with tab_fc:
                     st.write(f"⚠️ ENTSO-E load forecast: {e}")
             st.write("Training…")
             try:
-                st.session_state["fc"] = {"res": model.forecast(d, hp, horizon), "area": area, "src": src, "hist": d["price"]}
+                st.session_state["fc"] = {"res": model.forecast(d, hp, horizon), "area": area, "src": src, "hist": d["price"], "unit": U}
                 stat.update(label="Forecast ready", state="complete", expanded=False)
             except Exception as e:
                 stat.update(label=f"Forecast failed: {e}", state="error")
@@ -469,15 +507,15 @@ with tab_fc:
     else:
         res, hist = FC["res"], FC["hist"]
         T, acc = res["table"], res["accuracy"]
-        if FC["area"] != area:
-            st.warning(f"This forecast is for {FC['area']}. Click **Run forecast** for {area}.")
+        if FC["area"] != area or FC.get("unit") != U:
+            st.warning(f"This forecast is for {FC['area']} in {FC.get('unit')}. Click **Run forecast** to update it for {area} in {U}.")
         last7 = hist.dropna().iloc[-7:].mean()
         m = st.columns(4)
-        m[0].metric(f"Forecast average, next {len(T)} days", f"{T.forecast.mean():.1f} €/MWh",
+        m[0].metric(f"Forecast average, next {len(T)} days", f"{T.forecast.mean():{DP}} {U}",
                     f"{(T.forecast.mean() / last7 - 1) * 100:+.1f} % vs last 7 days", delta_color="inverse")
-        m[1].metric("Highest day", f"{T.forecast.max():.1f} €/MWh", T.forecast.idxmax().strftime("%a %d.%m"), delta_color="off")
-        m[2].metric("Lowest day", f"{T.forecast.min():.1f} €/MWh", T.forecast.idxmin().strftime("%a %d.%m"), delta_color="off")
-        m[3].metric("Typical error 1 / 7 days ahead", f"±{acc.mae.iloc[0]:.1f} / ±{acc.mae.iloc[-1]:.1f}",
+        m[1].metric("Highest day", f"{T.forecast.max():{DP}} {U}", T.forecast.idxmax().strftime("%a %d.%m"), delta_color="off")
+        m[2].metric("Lowest day", f"{T.forecast.min():{DP}} {U}", T.forecast.idxmin().strftime("%a %d.%m"), delta_color="off")
+        m[3].metric("Typical error 1 / 7 days ahead", f"±{acc.mae.iloc[0]:{DP}} / ±{acc.mae.iloc[-1]:{DP}}",
                     help="Average absolute error on the last 20 % of history, which the model did not see while fitting")
 
         c1, c2 = st.columns([3, 2])
@@ -492,21 +530,22 @@ with tab_fc:
                 go.Scatter(x=[lk] + list(T.index), y=[hist.get(lk)] + list(T.forecast), name="Forecast", mode="lines+markers",
                            line=dict(color=ORANGE, width=3, dash="dot"))])
             fig.add_vline(x=lk, line_dash="dash", line_color=GREY)
-            st.plotly_chart(fig_layout(fig, 420, yaxis_title="€/MWh"), width="stretch")
+            st.plotly_chart(fig_layout(fig, 420, yaxis_title=f"{U}"), width="stretch")
         with c2:
             st.subheader("Hourly forecast")
             Hh = res["hourly"]
             hm = Hh.pivot_table(index=Hh.index.normalize(), columns=Hh.index.hour, values="price")
             fig = go.Figure(go.Heatmap(z=hm.values, x=[f"{h:02d}:00" for h in hm.columns], y=[d.strftime("%a %d.%m") for d in hm.index],
-                                       colorscale="RdYlGn_r", colorbar=dict(title="€/MWh")))
+                                       colorscale="RdYlGn_r", colorbar=dict(title=f"{U}")))
             st.plotly_chart(fig_layout(fig, 420, yaxis=dict(autorange="reversed"), hovermode="closest"), width="stretch")
             st.caption("Daily forecast + the typical hourly pattern of the last 4 weeks (weekday/weekend).")
 
         show = T.copy()
         show.index = show.index.strftime("%a %d.%m.%Y")
-        show = show.rename(columns={"forecast": "Forecast €/MWh", "low": "Low (80 %)", "high": "High (80 %)", "temp": "Temp °C",
+        show = show.rename(columns={"forecast": f"Forecast {U}", "low": "Low (80 %)", "high": "High (80 %)", "temp": "Temp °C",
                                     "wind": "Wind m/s", "precip": "Rain mm", "load": "Consumption fc MW", "reservoir": "Reservoir vs median pp"})
-        st.dataframe(show.round(1), width="stretch")
+        price_cols = [c for c in show.columns if U in c or c.startswith(("Low", "High"))]
+        st.dataframe(show.round(1).assign(**{c: show[c].round(3 if NOK else 1) for c in price_cols}), width="stretch")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -515,7 +554,7 @@ with tab_fc:
             I.index = [model.FEATURE_LABELS.get(i, i) for i in I.index]
             I = I.reindex(I.abs().sum(axis=1).sort_values().index)
             fig = go.Figure([go.Bar(y=I.index, x=I[h], orientation="h", name=f"{h} day{'s' if h > 1 else ''} ahead") for h in I.columns])
-            st.plotly_chart(fig_layout(fig, 420, barmode="group", xaxis_title="€/MWh per typical change", hovermode="closest",
+            st.plotly_chart(fig_layout(fig, 420, barmode="group", xaxis_title=f"{U} per typical change", hovermode="closest",
                                        margin=dict(l=170, t=20, r=20, b=40)), width="stretch")
             if res["dropped"]:
                 st.caption("Not used (too little data): " + ", ".join(model.FEATURE_LABELS.get(c, c) for c in res["dropped"]))
@@ -523,14 +562,14 @@ with tab_fc:
             st.subheader("How accurate is it?")
             fig = go.Figure([go.Bar(x=[f"{h} d" for h in acc.index], y=acc.naive, name="Simple guess: same as last price", marker_color="#cbd5e0"),
                              go.Bar(x=[f"{h} d" for h in acc.index], y=acc.mae, name="This model", marker_color=ORANGE)])
-            st.plotly_chart(fig_layout(fig, 420, barmode="group", yaxis_title="Average error (€/MWh)", hovermode="closest"), width="stretch")
+            st.plotly_chart(fig_layout(fig, 420, barmode="group", yaxis_title=f"Average error ({U})", hovermode="closest"), width="stretch")
             st.caption(f"Beats the simple guess on {(acc.mae < acc.naive).sum()} of {len(acc)} horizons · trained on {acc.n_train.iloc[0]} days · prices from {FC['src']}.")
         if res["backtest"] is not None:
             st.subheader("Back-test: 3 days ahead vs what happened")
             b = res["backtest"]
             fig = go.Figure([go.Scatter(x=b.index, y=b.actual, name="Actual", line=dict(color=BLUE)),
                              go.Scatter(x=b.index, y=b.model, name="Model (3 days ahead)", line=dict(color=ORANGE, dash="dot"))])
-            st.plotly_chart(fig_layout(fig, 340, yaxis_title="€/MWh"), width="stretch")
+            st.plotly_chart(fig_layout(fig, 340, yaxis_title=f"{U}"), width="stretch")
 
 # ======================================================================= METHODOLOGY
 with tab_meth:

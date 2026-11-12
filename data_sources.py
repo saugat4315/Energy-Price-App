@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import io
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -287,6 +288,19 @@ def discharge(station_ids: tuple[str, ...], start: dt.date, end: dt.date) -> pd.
         cols[f"{s['stationName']} ({s['stationId']})"] = pd.Series(
             {pd.Timestamp(o["time"][:10]): o["value"] for o in s.get("observations", []) if o.get("value") is not None}, dtype=float)
     return pd.DataFrame(cols)
+
+
+# ---------------------------------------------------------------- Norges Bank exchange rate
+@st.cache_data(ttl=6 * 3600, show_spinner="Downloading EUR/NOK rates from Norges Bank…")
+def eur_nok(start: dt.date, end: dt.date) -> pd.Series:
+    """Official daily EUR→NOK rate (business days), forward-filled to every calendar day."""
+    r = _get("https://data.norges-bank.no/api/data/EXR/B.EUR.NOK.SP", {
+        "format": "csv", "startPeriod": str(start - dt.timedelta(days=10)), "endPeriod": str(end), "locale": "en"})
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.content.decode("utf-8-sig")), sep=None, engine="python")
+    s = pd.Series(pd.to_numeric(df["OBS_VALUE"], errors="coerce").values, index=pd.to_datetime(df["TIME_PERIOD"])).dropna()
+    days = pd.date_range(s.index.min(), pd.Timestamp(end) + pd.Timedelta(days=10), freq="D")
+    return s.reindex(days).ffill()
 
 
 def daily(s: pd.Series | pd.DataFrame):
